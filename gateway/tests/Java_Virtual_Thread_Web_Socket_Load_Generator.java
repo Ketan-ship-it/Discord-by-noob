@@ -1,3 +1,4 @@
+package gateway.tests;
 import java.io.*;
 import java.net.Socket;
 import java.util.Base64;
@@ -7,7 +8,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class Java_Virtual_Thread_Web_Socket_Load_Generator {
     
-    private static final String HOST = "10.114.190.72";
+    // private static final String HOST = "10.114.190.72";
+    private static final String HOST = "192.168.137.1";
     private static final int PORT = 9002;
 
     private static final int TOTAL_CONNECTIONS = 5000;
@@ -76,6 +78,7 @@ public class Java_Virtual_Thread_Web_Socket_Load_Generator {
 
             // Keep connection open
             Thread.sleep(600000);
+            socket.close();
 
         } catch (Exception e) {
             failed.incrementAndGet();
