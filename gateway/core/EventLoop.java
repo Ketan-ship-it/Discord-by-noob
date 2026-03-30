@@ -8,6 +8,7 @@ import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
+import java.nio.charset.StandardCharsets;
 import java.util.Iterator;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
@@ -40,7 +41,7 @@ public class EventLoop {
     private static long windowLatencyTotal = 0;
     private static long windowMaxLatency = 0;
 
-    private static final boolean DEBUG = false;
+    private static final boolean DEBUG = true;
     private static int port;
     private static long HANDSHAKE_TIMEOUT_MS ;
     private static long IDLE_TIMEOUT_MS ;
@@ -145,19 +146,19 @@ public class EventLoop {
         SocketChannel client = (SocketChannel) key.channel();
         Connection conn = (Connection) key.attachment();
 
-        int bytesRead = client.read(conn.buffer);
-
-        conn.lastActivity = System.currentTimeMillis();
-
-        if (bytesRead == -1) {
-            if (conn.state == ConnectionState.AWAITING_HEADERS) {
-                failedHandshakes.incrementAndGet();
-            }
-            close(key);
-            return;
-        }
-
         if (conn.state == ConnectionState.AWAITING_HEADERS) {
+            
+            int bytesRead = client.read(conn.buffer);
+
+            conn.lastActivity = System.currentTimeMillis();
+
+            if (bytesRead == -1) {
+                if (conn.state == ConnectionState.AWAITING_HEADERS) {
+                    failedHandshakes.incrementAndGet();
+                }
+                close(key);
+                return;
+            }
 
             if (BufferUtils.headersComplete(conn.buffer)) {
 
@@ -217,6 +218,20 @@ public class EventLoop {
                     }
                 });
             }
+        }else if(conn.state == ConnectionState.UPGRADED){
+            int read = client.read(conn.frameBuffer);
+
+            if(read == -1){
+                close(key);
+                return;
+            }
+
+            conn.frameBuffer.flip();
+
+            while(parseFrames(conn , client , key)){
+            }
+
+            conn.frameBuffer.compact();
         }
     }
 
@@ -334,4 +349,144 @@ public class EventLoop {
         }, 5, 5, TimeUnit.SECONDS);
     }
 
+    private static boolean parseFrames(Connection conn , SocketChannel client , SelectionKey key) throws IOException{
+
+        ByteBuffer buff = conn.frameBuffer;
+
+        if(buff.remaining() < 2) return false;
+
+        buff.mark();
+
+        byte b1 = buff.get();
+        byte b2 = buff.get();
+
+        boolean fin = (b1 & 0x80) != 0;
+        int opcode = b1 & 0x0F;
+
+        boolean masked = (b2 & 0x80) != 0;
+        int payloadLen = b2 & 0x7F;
+
+        // TODO: fragmentation not supported yet
+        /*
+            You’re reading FIN, but ignoring it means you assume “1 frame = 1 message” — which is usually true, but not guaranteed.
+            Adding fragmentation support is a bit more complex, but it’s the only way to be fully compliant with the spec. 
+            So it is ignored for now, but should be implemented in the future to handle edge cases and ensure compatibility with all clients.
+        */
+        if (!fin) {
+            return true;
+        }
+
+        if(payloadLen == 126){
+            if(buff.remaining() < 2){
+                buff.reset();
+                return false;
+            }
+            payloadLen = (int) buff.getShort() & 0xFFFF;
+        }else if(payloadLen == 127){
+            if (buff.remaining() < 8) {
+                buff.reset();
+                return false;
+            }
+            payloadLen = (int) buff.getLong();
+        }
+
+        byte[] maskingKey = null;
+
+        if(masked){
+            if(buff.remaining()<4){
+                buff.reset();
+                return false;
+            }
+            maskingKey = new byte[4];
+            buff.get(maskingKey);
+        }
+
+        if(buff.remaining() < payloadLen){
+            buff.reset();
+            return false;
+        }
+
+        byte[] payload = new byte[payloadLen];
+        buff.get(payload);
+
+        if(masked){
+            for(int i=0;i<payloadLen;i++){
+                payload[i]^=maskingKey[i%4];
+            }
+        }
+
+        handleFrames(conn , client , key , opcode , payload );
+
+        return true;
+    }
+
+    private static void handleFrames(Connection conn , SocketChannel client ,SelectionKey key, int opcode , byte[]payload) throws IOException{
+
+        switch (opcode){
+
+            case 0x1: 
+                //text frame
+                String message = new String(payload);
+                if(DEBUG){
+                    System.out.println("Received message: " + message);
+                }
+
+                sendText(client , message);
+                break;
+
+            case 0X8:
+                //close frame
+                //client.close(); This causes issues because the selector still has the key registered, so we need to close it through the event loop to ensure proper cleanup and avoid exceptions.
+                close(key);
+                break;
+                
+            case 0x9:
+                // ping frame
+                sendPong(client);
+                break;
+        }
+    }
+
+    private static void sendText(SocketChannel client , String message) throws IOException{
+
+        byte[] data = message.getBytes(StandardCharsets.UTF_8);
+        int len = data.length;
+
+        ByteBuffer frame;
+
+        if(len <= 125){
+            frame = ByteBuffer.allocate(2 + len);
+            frame.put((byte)0x81);
+            frame.put((byte)len);
+        }else if(len <= 65535){
+            frame = ByteBuffer.allocate(4 + len);
+            frame.put((byte)0x81);
+            frame.put((byte)126);
+            frame.putShort((short)len);
+        }else{
+            frame = ByteBuffer.allocate(10 + len);
+            frame.put((byte)0x81);
+            frame.put((byte)127);
+            frame.putLong(len);
+        }
+
+        frame.put(data);
+        frame.flip();
+
+        client.write(frame);
+
+    }
+
+    private static void sendPong(SocketChannel client)
+        throws IOException {
+
+        ByteBuffer frame = ByteBuffer.allocate(2);
+
+        frame.put((byte)0x8A);
+        frame.put((byte)0);
+
+        frame.flip();
+
+        client.write(frame);
+    }
 }

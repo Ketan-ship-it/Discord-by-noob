@@ -6,7 +6,7 @@ public class Connection {
 
     private static final int BUFFER_SIZE = 8192;
 
-    public ByteBuffer frameBuffer;
+    public ByteBuffer frameBuffer = ByteBuffer.allocateDirect(16384);
 
     public ByteBuffer buffer = ByteBuffer.allocateDirect(BUFFER_SIZE);
     public ConnectionState state = ConnectionState.AWAITING_HEADERS;
