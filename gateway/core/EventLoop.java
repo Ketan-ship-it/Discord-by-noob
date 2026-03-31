@@ -221,6 +221,8 @@ public class EventLoop {
         }else if(conn.state == ConnectionState.UPGRADED){
             int read = client.read(conn.frameBuffer);
 
+            conn.lastActivity = System.currentTimeMillis();
+
             if(read == -1){
                 close(key);
                 return;
@@ -256,6 +258,8 @@ public class EventLoop {
                 conn.buffer.clear();
 
                 key.interestOps(SelectionKey.OP_READ);
+
+                // sendHello(client);
             }
         }
     }
@@ -272,15 +276,27 @@ public class EventLoop {
             Connection conn =
                     (Connection) key.attachment();
 
+            if(DEBUG){
+                System.out.println("Conn lastActivity: " + conn.lastActivity +
+                           " | now: " + now +
+                           " | diff: " + (now - conn.lastActivity));
+            }
+
             if (conn.state == ConnectionState.AWAITING_HEADERS &&
                 now - conn.startTime > HANDSHAKE_TIMEOUT_MS) {
 
                 failedHandshakes.incrementAndGet();
+                if(DEBUG){
+                    System.out.println("Closing connection due to handshake timeout");
+                }
                 close(key);
 
             } else if (conn.state == ConnectionState.UPGRADED &&
                        now - conn.lastActivity > IDLE_TIMEOUT_MS) {
 
+                if(DEBUG){
+                    System.out.println("Closing connection due to idle timeout");
+                }
                 close(key);
             }
         }
@@ -363,6 +379,10 @@ public class EventLoop {
         boolean fin = (b1 & 0x80) != 0;
         int opcode = b1 & 0x0F;
 
+        if(DEBUG){
+            System.out.println("Received frame opcode: " + opcode);
+        }
+
         boolean masked = (b2 & 0x80) != 0;
         int payloadLen = b2 & 0x7F;
 
@@ -431,7 +451,7 @@ public class EventLoop {
                     System.out.println("Received message: " + message);
                 }
 
-                sendText(client , message);
+                sendText(conn , client , message);
                 break;
 
             case 0X8:
@@ -442,12 +462,14 @@ public class EventLoop {
                 
             case 0x9:
                 // ping frame
-                sendPong(client);
+                sendPong(conn , client);
                 break;
         }
     }
 
-    private static void sendText(SocketChannel client , String message) throws IOException{
+    private static void sendText(Connection conn ,SocketChannel client , String message) throws IOException{
+
+        conn.lastActivity = System.currentTimeMillis(); // ✅ Missing this caused connections to be closed after handshake because the idle timeout thought they were inactive. Now we update lastActivity whenever we send a message to ensure the connection stays alive as long as there is activity.
 
         byte[] data = message.getBytes(StandardCharsets.UTF_8);
         int len = data.length;
@@ -477,9 +499,10 @@ public class EventLoop {
 
     }
 
-    private static void sendPong(SocketChannel client)
+    private static void sendPong(Connection conn , SocketChannel client)
         throws IOException {
 
+        conn.lastActivity = System.currentTimeMillis(); // ✅ Missing this caused connections to be closed after handshake because the idle timeout thought they were inactive. Now we update lastActivity whenever we send a message to ensure the connection stays alive as long as there is activity.
         ByteBuffer frame = ByteBuffer.allocate(2);
 
         frame.put((byte)0x8A);
@@ -489,4 +512,43 @@ public class EventLoop {
 
         client.write(frame);
     }
+
+    private static void sendHello(Connection conn ,SocketChannel client) throws IOException{
+
+        ByteBuffer on_handshake_instructions = ByteBuffer.allocate(1+4);
+
+        on_handshake_instructions.put((byte)10);  //opcode for "hello" message
+        on_handshake_instructions.putInt(3000); //heartbeat interval in ms
+
+        on_handshake_instructions.flip();
+
+        if (DEBUG) {
+            System.out.println("Sending hello message");
+        }
+
+        sendBinaryFrame(conn , client , on_handshake_instructions);
+        
+    }
+
+    private static void sendBinaryFrame(Connection conn , SocketChannel client , ByteBuffer on_handshake_instructions) throws IOException{
+
+        conn.lastActivity = System.currentTimeMillis(); // ✅ Missing this caused connections to be closed after handshake because the idle timeout thought they were inactive. Now we update lastActivity whenever we send a message to ensure the connection stays alive as long as there is activity.
+        int len = on_handshake_instructions.remaining();
+
+        ByteBuffer frame = ByteBuffer.allocate(2 + len);
+        frame.put((byte)0x82); //binary frame opcode
+
+        if(len <= 125){
+            frame.put((byte)len);
+        }else{
+            throw new IllegalArgumentException("Payload too large for now");
+        }
+
+        frame.put(on_handshake_instructions);
+        frame.flip();
+
+        client.write(frame);
+
+    }
+
 }
